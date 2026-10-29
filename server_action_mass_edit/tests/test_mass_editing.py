@@ -4,6 +4,7 @@
 # License AGPL-3.0 or later (http://www.gnu.org/licenses/agpl).
 
 from ast import literal_eval
+from unittest import mock
 
 import psycopg2
 
@@ -526,6 +527,81 @@ class TestMassEditing(common.TransactionCase):
                 "Dynamic field %s leaked into _fields after a failing "
                 "onchange call." % fname,
             )
+
+    def _reset_field_triggers(self):
+        """Drop the registry's cached field triggers so the next access
+        rebuilds them, as it happens in a freshly started worker."""
+        self.registry.__dict__.pop("_field_triggers", None)
+        self.registry._field_trigger_trees.clear()
+        self.registry._is_modifying_relations.clear()
+
+    def _prepare_registry_test(self):
+        """Return the wizard bound to the demo server action and register the
+        cleanup that keeps a failing run from poisoning the rest of the suite:
+        ``_fields`` and the field triggers are process state, not database
+        state, so the test transaction rollback does not restore them."""
+        wizard_class = self.registry[self.MassEditingWizard._name]
+
+        def cleanup():
+            for fname in list(wizard_class._fields):
+                if fname.startswith("selection__"):
+                    wizard_class._fields.pop(fname)
+            self._reset_field_triggers()
+
+        self.addCleanup(cleanup)
+        return self.MassEditingWizard.with_context(
+            server_action_id=self.mass_editing_user.id,
+            active_ids=[],
+            original_active_ids=[],
+        )
+
+    def test_onchange_keeps_registry_usable_on_cold_triggers(self):
+        """The first ``onchange`` of a worker whose field triggers are not
+        built yet must not break the registry.
+
+        Building the triggers walks every field of every model. When it runs
+        inside the wizard's ``onchange`` (``modified`` on the new record), the
+        dynamic fields are part of that walk: unbound, they resolve
+        ``registry[None]``, the ``onchange`` fails with ``KeyError: None`` and
+        every later write of the worker fails the same way.
+        """
+        wizard = self._prepare_registry_test()
+        field_onchange = {}
+        for line in self.mass_editing_user.mass_edit_line_ids:
+            field_onchange["selection__" + line.field_id.name] = "1"
+            field_onchange[line.field_id.name] = ""
+        self.assertTrue(field_onchange, "demo data should have lines")
+        self._reset_field_triggers()
+
+        wizard.onchange({}, [], field_onchange)
+
+        self.assertFalse(
+            [f for f in wizard._fields if f.startswith("selection__")],
+            "Dynamic fields leaked into _fields after the onchange.",
+        )
+        self.ResPartner.create({"name": "Written after the mass edit wizard"})
+
+    def test_onchange_failure_keeps_registry_usable(self):
+        """A failing ``onchange`` must not leave any dynamic field in
+        ``_fields``. The write afterwards is only a sanity check: once the
+        fields are bound, a leaked one would not break it, so the assertion
+        on ``_fields`` is what guards the cleanup."""
+        wizard = self._prepare_registry_test()
+
+        def failing_onchange(inst, values, field_name, field_onchange):
+            raise UserError("boom")  # pylint: disable=translation-required
+
+        with mock.patch.object(
+            models.Model, "onchange", failing_onchange
+        ), self.assertRaises(UserError):
+            wizard.onchange({}, [], {})
+
+        self.assertFalse(
+            [f for f in wizard._fields if f.startswith("selection__")],
+            "Dynamic fields leaked into _fields after a failing onchange.",
+        )
+        self._reset_field_triggers()
+        self.ResPartner.create({"name": "Written after a failing onchange"})
 
     def test_mass_edit_partner_sql_error(self):
         vals = {
